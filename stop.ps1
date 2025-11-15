@@ -1,6 +1,6 @@
 # stop.ps1 — stops the dev backend & frontend launched by run.ps1
 
-$root   = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pidFile = Join-Path $root ".devpids.json"
 
 if (-not (Test-Path $pidFile)) {
@@ -17,11 +17,13 @@ try {
 
 $killed = @()
 foreach ($name in "backend","frontend") {
-  $pid = $p.$name
-  if ($pid -and (Get-Process -Id $pid -ErrorAction SilentlyContinue)) {
-    Write-Host "Stopping $name (PID $pid)..." -ForegroundColor Cyan
-    Stop-Process -Id $pid -Force
+  $procId = $p.$name  # <-- avoid $PID reserved var
+  if ($procId -and (Get-Process -Id $procId -ErrorAction SilentlyContinue)) {
+    Write-Host "Stopping $name (PID $procId)..." -ForegroundColor Cyan
+    Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
     $killed += $name
+  } else {
+    Write-Host "$name not running or PID not found." -ForegroundColor DarkYellow
   }
 }
 
