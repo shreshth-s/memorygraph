@@ -20,3 +20,18 @@ create table if not exists facts (
   reward_count int default 0,
   created_at timestamptz default now()
 );
+
+create table if not exists conversations (
+  id uuid primary key default gen_random_uuid(),
+  npc text not null references entities(id),
+  player text not null references entities(id),
+  scene text,
+  tags text[] default '{}',
+  created_at timestamptz default now()
+);
+
+create table if not exists conversation_facts (
+  conversation_id uuid references conversations(id) on delete cascade,
+  fact_id uuid references facts(id) on delete cascade,
+  primary key (conversation_id, fact_id)
+);

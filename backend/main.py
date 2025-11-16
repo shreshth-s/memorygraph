@@ -48,14 +48,29 @@ def facts_add(payload: dict):
         row = cur.fetchone(); c.commit()
         return {"fact_id": str(row["id"])}
 
+def jaccard(a, b):
+    sa, sb = set(a or []), set(b or [])
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
 @app.get("/v0/retrieve")
 def retrieve(
     npc_id: str = Query(...),
     player_id: str = Query(...),
-    scene: Optional[str] = None,
-    intent: Optional[str] = None,
+    scene: str | None = None,
+    intent: str | None = None,
     k: int = 6,
+    conversation_id: str | None = None,
 ):
+    conv_tags = []
+    if conversation_id:
+        with conn() as c, c.cursor() as cur:
+            cur.execute("select tags from conversations where id=%s", (conversation_id,))
+            r = cur.fetchone()
+            if r:
+                conv_tags = r["tags"] or []
+
     with conn() as c, c.cursor() as cur:
         cur.execute("""
           select id, text, tags, weight, pinned, scene, intent
@@ -69,13 +84,10 @@ def retrieve(
     out = []
     for r in rows:
         scene_match = 1.0 if (scene and r["scene"] == scene) else 0.0
-        base = 0.9*float(r["weight"]) + 0.1*scene_match
-        intent_bonus = 0.0
-        if intent:
-            t = r["tags"] or []
-            if intent == r.get("intent") or intent in t:
-                intent_bonus = 0.2
-        score = base + intent_bonus
+        base = 0.9 * float(r["weight"]) + 0.1 * scene_match
+        intent_bonus = 0.2 if intent and (intent == r["intent"] or intent in (r["tags"] or [])) else 0.0
+        assoc_bonus = 0.15 * jaccard(r["tags"] or [], conv_tags)
+        score = base + intent_bonus + assoc_bonus
         out.append({
             "fact_id": str(r["id"]),
             "text": r["text"],
@@ -85,9 +97,16 @@ def retrieve(
             "scene": r["scene"],
             "intent": r["intent"],
             "score": round(score, 4),
+              "debug": {
+                "base": round(base, 4),
+                "intent_bonus": round(intent_bonus, 4),
+                "assoc_bonus": round(assoc_bonus, 4)
+            }
         })
+
     out = sorted(out, key=lambda x: (not x["pinned"], -x["score"]))[:k]
     return out
+
 
 @app.post("/v0/pin")
 def pin(payload: dict):
@@ -118,3 +137,106 @@ def feedback(payload: dict):
         """, (neww, rsum, rcnt, fid))
         c.commit()
         return {"ok": True, "fact_id": fid, "old_weight": old, "new_weight": neww}
+    
+    
+@app.post("/v0/conversations.start")
+def conv_start(payload: dict):
+    npc = payload.get("npc_id"); player = payload.get("player_id"); scene = payload.get("scene")
+    if not npc or not player: raise HTTPException(400, "npc_id and player_id required")
+    with conn() as c, c.cursor() as cur:
+        cur.execute("insert into conversations (npc,player,scene) values (%s,%s,%s) returning id",
+                    (npc,player,scene))
+        row = cur.fetchone(); c.commit()
+        return {"conversation_id": str(row["id"])}
+
+@app.post("/v0/conversations.attach")
+def conv_attach(payload: dict):
+    from fastapi import HTTPException
+    cid = payload.get("conversation_id")
+    fact_ids = [fid for fid in payload.get("fact_ids", []) if fid]
+
+    if not cid or not fact_ids:
+        raise HTTPException(400, "conversation_id and fact_ids required")
+
+    try:
+        with conn() as c, c.cursor() as cur:
+            # Verify conversation exists
+            cur.execute("select 1 from conversations where id=%s", (cid,))
+            if not cur.fetchone():
+                raise HTTPException(400, f"conversation_id not found: {cid}")
+
+            # Verify all facts exist
+            cur.execute("select count(*) as n from facts where id = any(%s)", (fact_ids,))
+            n = cur.fetchone()["n"]
+            if n != len(fact_ids):
+                raise HTTPException(400, f"one or more fact_ids not found ({n}/{len(fact_ids)} exist)")
+
+            # Attach (idempotent)
+            for fid in fact_ids:
+                cur.execute("""
+                    insert into conversation_facts (conversation_id, fact_id)
+                    values (%s, %s)
+                    on conflict do nothing
+                """, (cid, fid))
+
+            # Roll up tags
+# 4) roll up tags from attached facts (distinct)
+            cur.execute("""
+            update conversations
+                set tags = coalesce((
+                select array_agg(distinct t.tag)
+                    from (
+                    select unnest(coalesce(f.tags, '{}'::text[])) as tag
+                        from facts f
+                        join conversation_facts cf on cf.fact_id = f.id
+                        where cf.conversation_id = %s
+                    ) t
+                ), '{}'::text[])
+            where id = %s
+            """, (cid, cid))
+
+
+            c.commit()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # surface the DB error text for debugging instead of a 500 mystery
+        raise HTTPException(400, f"attach_failed: {e}")
+
+@app.get("/v0/export")
+def export_all():
+    with conn() as c, c.cursor() as cur:
+        cur.execute("select id, kind from entities order by id")
+        entities = cur.fetchall()
+        cur.execute("""
+          select id, who, about, scene, type, intent, text, tags, weight, pinned, created_at
+            from facts
+           order by created_at asc
+        """)
+        facts = cur.fetchall()
+        return {"entities": entities, "facts": facts}
+
+@app.post("/v0/import")
+def import_all(payload: dict):
+    ents = payload.get("entities", [])
+    facts = payload.get("facts", [])
+    with conn() as c, c.cursor() as cur:
+        for e in ents:
+            cur.execute("""
+              insert into entities (id, kind) values (%s, %s)
+              on conflict (id) do nothing
+            """, (e["id"], e["kind"]))
+        for f in facts:
+            cur.execute("""
+              insert into facts (id, who, about, scene, type, intent, text, tags, weight, pinned, created_at)
+              values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+              on conflict (id) do nothing
+            """, (
+                f["id"], f["who"], f["about"], f["scene"], f["type"], f.get("intent"),
+                f["text"], f.get("tags") or [], f.get("weight", 0.5), f.get("pinned", False),
+                f.get("created_at"),
+            ))
+        c.commit()
+    return {"ok": True}
+

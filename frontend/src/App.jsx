@@ -24,9 +24,15 @@ export default function App() {
   const [loadingEntities, setLoadingEntities] = useState(true)
   const [entitiesError, setEntitiesError] = useState('')
 
-  const [npcReply, setNpcReply] = useState('')
+  const [conversationId, setConversationId] = useState('')
+  const [convStatus, setConvStatus] = useState('idle')
 
-  // Load NPCs and Players from backend on mount
+  const [reply, setReply] = useState('')
+  const [replying, setReplying] = useState(false)
+
+  const [msg, setMsg] = useState('')
+  const [showDebug, setShowDebug] = useState(false)
+
   useEffect(() => {
     const loadEntities = async () => {
       try {
@@ -34,28 +40,41 @@ export default function App() {
         const res = await fetch(`${API}/v0/entities`)
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const data = await res.json()
-        const npcs = data.filter((e) => e.kind === 'npc')
-        const players = data.filter((e) => e.kind === 'player')
-
+        const npcs = data.filter(e => e.kind === 'npc')
+        const players = data.filter(e => e.kind === 'player')
         setNpcEntities(npcs)
         setPlayerEntities(players)
-
         if (npcs.length > 0) setNpc(npcs[0].id)
         if (players.length > 0) setPlayer(players[0].id)
-      } catch (err) {
-        console.error(err)
+      } catch {
         setEntitiesError('Failed to load entities')
       } finally {
         setLoadingEntities(false)
       }
     }
-
     loadEntities()
   }, [])
 
+  const startConversation = async () => {
+    if (!npc || !player) return
+    setConvStatus('starting')
+    const res = await fetch(`${API}/v0/conversations.start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ npc_id: npc, player_id: player, scene })
+    })
+    const data = await res.json()
+    setConversationId(data.conversation_id || '')
+    setConvStatus(data.conversation_id ? 'active' : 'idle')
+  }
+
+  const resetConversation = () => {
+    setConversationId('')
+    setConvStatus('idle')
+  }
+
   const addFact = async () => {
     if (!line.trim() || !npc || !player) return
-
     await fetch(`${API}/v0/facts.add`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -66,27 +85,27 @@ export default function App() {
         type: 'event',
         intent: intent || null,
         text: line,
-        tags: intent ? [intent] : [],
-        weight: 0.7,
+        tags: intent ? [intent] : []
       }),
     })
-
     setLine('')
   }
 
   const retrieve = async () => {
     if (!npc || !player) return
-
-    const params = new URLSearchParams({
-      npc_id: npc,
-      player_id: player,
-      scene,
-    })
+    const params = new URLSearchParams({ npc_id: npc, player_id: player, scene })
     if (intent) params.set('intent', intent)
-
+    if (conversationId) params.set('conversation_id', conversationId)
     const res = await fetch(`${API}/v0/retrieve?` + params.toString())
     const data = await res.json()
     setFacts(data)
+    if (conversationId && data.length) {
+      await fetch(`${API}/v0/conversations.attach`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversation_id: conversationId, fact_ids: data.map(f => f.fact_id) })
+      })
+    }
   }
 
   const togglePin = async (id, pinned) => {
@@ -98,39 +117,80 @@ export default function App() {
     retrieve()
   }
 
-  const sendFeedback = async (id, reward) => {
-    await fetch(`${API}/v0/feedback`, {
+  const sendFeedback = async (id, reward, oldWeight) => {
+    const res = await fetch(`${API}/v0/feedback`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fact_id: id, reward }),
+      body: JSON.stringify({ fact_id: id, reward })
     })
+    const data = await res.json().catch(() => ({}))
+    const newW = data?.weight ?? null
+    if (typeof newW === 'number') {
+      setMsg(`weight: ${Number(oldWeight).toFixed(2)} → ${Number(newW).toFixed(2)}`)
+    } else {
+      setMsg(reward > 0 ? '👍 recorded' : '👎 recorded')
+    }
+    setTimeout(() => setMsg(''), 1500)
     retrieve()
   }
 
-  const generateFakeReply = () => {
-    if (!facts.length) {
-      setNpcReply('idk u well enough yet.')
-      return
+  const generateFakeReply = async () => {
+    if (!npc || !player) return
+    setReplying(true)
+    const params = new URLSearchParams({ npc_id: npc, player_id: player, scene })
+    if (intent) params.set('intent', intent)
+    if (conversationId) params.set('conversation_id', conversationId)
+    const res = await fetch(`${API}/v0/retrieve?` + params.toString())
+    const data = await res.json()
+    if (conversationId && data.length) {
+      await fetch(`${API}/v0/conversations.attach`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversation_id: conversationId, fact_ids: data.map(f => f.fact_id) })
+      })
     }
+    const top = data[0]
+    const mems = data.slice(0, 3).map(f => f.text).join(' | ')
+    const tag = intent || (top?.intent || '')
+    const speaker = npc.includes(':') ? npc.split(':')[1] : npc
+    setReply(top ? `${speaker}: ${tag ? `[${tag}] ` : ''}${mems}` : `${speaker}: …`)
+    setReplying(false)
+  }
 
-    const top = facts[0]
-    const tags = top.tags || []
+  const exportAll = async () => {
+    const res = await fetch(`${API}/v0/export`)
+    const data = await res.json()
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'memorygraph-export.json'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  }
 
-    let reply = ''
-
-    if (tags.includes('debt') || tags.includes('money')) {
-      reply = 'you still owe me money. pay up before you ask for more.'
-    } else if (tags.includes('favor') || tags.includes('gift_help')) {
-      reply = 'i remember what you did for me. i can cut you some slack.'
-    } else if (tags.includes('crime') || tags.includes('betrayal')) {
-      reply = "i haven't forgotten what you did. i'm watching you."
-    } else if (intent === 'confess') {
-      reply = "fine. at least you're being honest about it this time."
+  const importAll = async (file) => {
+    if (!file) return
+    const text = await file.text()
+    const payload = JSON.parse(text)
+    const res = await fetch(`${API}/v0/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    if (res.ok) {
+      setMsg('Imported. Reloading entities…')
+      const ents = await fetch(`${API}/v0/entities`).then(r => r.json())
+      const npcs = ents.filter(e => e.kind === 'npc')
+      const players = ents.filter(e => e.kind === 'player')
+      setNpcEntities(npcs); setPlayerEntities(players)
+      setMsg('')
     } else {
-      reply = "alright. let's see what you want this time."
+      setMsg('Import failed')
+      setTimeout(() => setMsg(''), 1500)
     }
-
-    setNpcReply(reply)
   }
 
   return (
@@ -146,18 +206,24 @@ export default function App() {
       <div>
         <h2>MemoryGraph Playground</h2>
 
+        {msg && (
+          <div style={{ marginBottom: 8, padding: 8, border: '1px solid #ddd', borderRadius: 6 }}>
+            {msg}
+          </div>
+        )}
+
         {loadingEntities && <div>Loading NPCs &amp; players...</div>}
         {entitiesError && (
           <div style={{ color: 'red', marginBottom: 8 }}>{entitiesError}</div>
         )}
 
-        <div style={{ marginBottom: 8 }}>
+        <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
           <label>
             NPC:&nbsp;
             <select
               value={npc}
               onChange={(e) => setNpc(e.target.value)}
-              disabled={loadingEntities || npcEntities.length === 0}
+              disabled={loadingEntities || npcEntities.length === 0 || convStatus === 'active'}
             >
               {npcEntities.map((e) => (
                 <option key={e.id} value={e.id}>
@@ -166,15 +232,13 @@ export default function App() {
               ))}
             </select>
           </label>
-        </div>
 
-        <div style={{ marginBottom: 8 }}>
           <label>
             Player:&nbsp;
             <select
               value={player}
               onChange={(e) => setPlayer(e.target.value)}
-              disabled={loadingEntities || playerEntities.length === 0}
+              disabled={loadingEntities || playerEntities.length === 0 || convStatus === 'active'}
             >
               {playerEntities.map((e) => (
                 <option key={e.id} value={e.id}>
@@ -188,20 +252,48 @@ export default function App() {
         <div style={{ marginBottom: 8 }}>
           <label>
             Scene:&nbsp;
-            <input value={scene} onChange={(e) => setScene(e.target.value)} />
+            <input
+              value={scene}
+              onChange={(e) => setScene(e.target.value)}
+              disabled={convStatus === 'active'}
+            />
           </label>
         </div>
 
         <div style={{ marginBottom: 8 }}>
           <label>
             Intent:&nbsp;
-            <select value={intent} onChange={(e) => setIntent(e.target.value)}>
+            <select
+              value={intent}
+              onChange={(e) => setIntent(e.target.value)}
+            >
               {INTENTS.map((opt) => (
                 <option key={opt.value} value={opt.value}>
                   {opt.label}
                 </option>
               ))}
             </select>
+          </label>
+        </div>
+
+        <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          {conversationId ? (
+            <>
+              <button disabled>Conversation: {conversationId.slice(0, 8)}…</button>
+              <button onClick={resetConversation}>New Conversation</button>
+            </>
+          ) : (
+            <button onClick={startConversation} disabled={!npc || !player || convStatus === 'starting'}>
+              {convStatus === 'starting' ? 'Starting…' : 'Start Conversation'}
+            </button>
+          )}
+          <label style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+            <input
+              type="checkbox"
+              checked={showDebug}
+              onChange={(e) => setShowDebug(e.target.checked)}
+            />
+            <span>Show score breakdown</span>
           </label>
         </div>
 
@@ -215,38 +307,32 @@ export default function App() {
           />
         </div>
 
-        <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-          <button onClick={addFact} disabled={!npc || !player}>
-            Add Fact
+        <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+          <button onClick={addFact} disabled={!npc || !player}>Add Fact</button>
+          <button onClick={retrieve} disabled={!npc || !player}>Retrieve Top-K</button>
+          <button onClick={generateFakeReply} disabled={!npc || !player || replying}>
+            {replying ? 'Thinking…' : 'Generate Fake Reply'}
           </button>
-          <button onClick={retrieve} disabled={!npc || !player}>
-            Retrieve Top-K
-          </button>
-          <button onClick={generateFakeReply} disabled={!npc || !player}>
-            Generate Fake Reply
-          </button>
+          <button onClick={exportAll}>Export JSON</button>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ border: '1px solid #ccc', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>
+              Import JSON
+            </span>
+            <input type="file" accept="application/json" style={{ display: 'none' }}
+              onChange={(e) => importAll(e.target.files?.[0])} />
+          </label>
         </div>
 
-        <p style={{ opacity: 0.7, marginTop: 8 }}>
-          Tip: pick an NPC/player, choose Intent = Confess, type &quot;I still
-          owe you that 10 gold&quot;, Add Fact, then Retrieve or Generate Fake
-          Reply.
-        </p>
-
-        {npcReply && (
-          <div
-            style={{
-              marginTop: 16,
-              padding: 12,
-              border: '1px solid #ccc',
-              borderRadius: 8,
-              background: '#f7f7f7',
-            }}
-          >
-            <strong>npc reply:</strong>
-            <p>{npcReply}</p>
+        {reply && (
+          <div style={{ marginTop: 10, padding: 10, border: '1px solid #ddd', borderRadius: 8 }}>
+            <strong>Reply</strong>
+            <div>{reply}</div>
           </div>
         )}
+
+        <p style={{ opacity: 0.7, marginTop: 8 }}>
+          Tip: start a conversation, add a confess line like “i still owe you 10 gold”, then Retrieve or Generate Fake Reply.
+        </p>
       </div>
 
       <div>
@@ -263,27 +349,29 @@ export default function App() {
               marginBottom: 8,
             }}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
               <strong>{f.text}</strong>
               <span>score: {f.score}</span>
             </div>
             <div style={{ fontSize: 12, opacity: 0.8 }}>
-              scene: {f.scene || '—'} | weight: {f.weight} | pinned:{' '}
-              {String(f.pinned)} | intent: {f.intent || '—'}
+              scene: {f.scene || '—'} | weight: {Number(f.weight).toFixed(2)} | pinned: {String(f.pinned)} | intent: {f.intent || '—'}
             </div>
             <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
               tags: {(f.tags || []).join(', ') || '—'}
             </div>
-            <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+            {showDebug && f.debug && (
+              <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>
+                base {f.debug.base} · intent {f.debug.intent_bonus} · assoc {f.debug.assoc_bonus}
+              </div>
+            )}
+            <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               {!f.pinned ? (
                 <button onClick={() => togglePin(f.fact_id, true)}>Pin</button>
               ) : (
-                <button onClick={() => togglePin(f.fact_id, false)}>
-                  Unpin
-                </button>
+                <button onClick={() => togglePin(f.fact_id, false)}>Unpin</button>
               )}
-              <button onClick={() => sendFeedback(f.fact_id, 1)}>👍</button>
-              <button onClick={() => sendFeedback(f.fact_id, -1)}>👎</button>
+              <button onClick={() => sendFeedback(f.fact_id, +1, f.weight)}>👍</button>
+              <button onClick={() => sendFeedback(f.fact_id, -1, f.weight)}>👎</button>
             </div>
           </div>
         ))}
