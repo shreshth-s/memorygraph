@@ -137,24 +137,40 @@ export default function App() {
   const generateFakeReply = async () => {
     if (!npc || !player) return
     setReplying(true)
-    const params = new URLSearchParams({ npc_id: npc, player_id: player, scene })
-    if (intent) params.set('intent', intent)
-    if (conversationId) params.set('conversation_id', conversationId)
-    const res = await fetch(`${API}/v0/retrieve?` + params.toString())
-    const data = await res.json()
-    if (conversationId && data.length) {
-      await fetch(`${API}/v0/conversations.attach`, {
+    try {
+      // ensure a conversation exists, so attachments/tags accumulate
+      if (!conversationId) {
+        await startConversation()
+      }
+      const body = {
+        npc_id: npc,
+        player_id: player,
+        scene,
+        conversation_id: conversationId || undefined,
+        user_text: line || '',    // optional; gives flavor to templates
+        intent: intent || undefined
+      }
+      const res = await fetch(`${API}/v0/reply.fake`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversation_id: conversationId, fact_ids: data.map(f => f.fact_id) })
+        body: JSON.stringify(body)
       })
+      if (!res.ok) {
+        setMsg(`fake reply failed: HTTP ${res.status}`)
+        setTimeout(() => setMsg(''), 2000)
+        return
+      }
+      const data = await res.json()
+      setReply(data?.reply || '(no reply)')
+      // sync inspector for visibility
+      retrieve()
+    } catch (e) {
+      console.error(e)
+      setMsg('fake reply error (see console)')
+      setTimeout(() => setMsg(''), 2000)
+    } finally {
+      setReplying(false)
     }
-    const top = data[0]
-    const mems = data.slice(0, 3).map(f => f.text).join(' | ')
-    const tag = intent || (top?.intent || '')
-    const speaker = npc.includes(':') ? npc.split(':')[1] : npc
-    setReply(top ? `${speaker}: ${tag ? `[${tag}] ` : ''}${mems}` : `${speaker}: …`)
-    setReplying(false)
   }
 
   const exportAll = async () => {

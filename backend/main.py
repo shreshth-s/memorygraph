@@ -1,3 +1,5 @@
+import random
+import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
@@ -240,3 +242,120 @@ def import_all(payload: dict):
         c.commit()
     return {"ok": True}
 
+def _npc_name(npc_id: str) -> str:
+    return npc_id.split(":")[-1] if ":" in npc_id else npc_id
+
+def _fake_reply_line(npc_name: str, scene: str, intent: str | None, user_text: str, facts: list[dict]) -> str:
+    top = facts[0] if facts else None
+    mem = (top or {}).get("text", "")
+    intent = (intent or "").strip().lower()
+
+    # light variation so it doesn't feel identical each time
+    rng = random.Random((npc_name + scene + (mem or "") + (intent or "")).encode("utf-8"))
+    pick = lambda xs: xs[rng.randrange(len(xs))]
+
+    # small helpers to “hint” memory without copying it verbatim
+    def hint_from_mem(m: str) -> str:
+        if not m:
+            return ""
+        # grab a short clause/snippet
+        s = m.strip().rstrip(".!?")
+        if len(s) > 80:
+            s = s[:80].rsplit(" ", 1)[0]
+        return s
+
+    h = hint_from_mem(mem)
+
+    templates = {
+        "confess": [
+            f"look… about earlier — {h}… i owe you for that.",
+            f"alright, i’ll come clean: {h.lower()} — that’s on me.",
+            f"you’re right. i haven’t forgotten — {h.lower()}."
+        ],
+        "deny": [
+            f"nah, that’s not how it happened. you’ve got it twisted.",
+            f"who told you that? {h.lower()}? no chance.",
+            f"i don’t buy it. rumors don’t make it true."
+        ],
+        "ask_favor": [
+            f"listen, can you help me with {h.lower() or 'something in the back'}?",
+            f"could use a hand — small favor, won’t take long.",
+            f"mind doing me a solid? i’ll make it worth your while."
+        ],
+        "gift_help": [
+            f"here — take this. call it thanks for {h.lower() or 'stopping by'}.",
+            f"i set something aside for you; you’ve earned it.",
+            f"i can help — say the word and it’s yours."
+        ],
+        "threaten": [
+            f"careful. keep pushing and you won’t like what follows.",
+            f"watch it. i’ve got eyes in this {scene}.",
+            f"back off. last warning."
+        ],
+        "default": [
+            f"yeah? i hear you. about {h.lower() or 'that'}, what do you want from me?",
+            f"alright — let’s talk. where do you want to take this?",
+            f"fine. say your piece and i’ll say mine."
+        ]
+    }
+
+    bank = templates.get(intent, templates["default"])
+    line = pick(bank)
+
+    # add speaker name
+    return f"{npc_name}: {line}"
+    
+
+@app.post("/v0/reply.fake")
+def v0_reply_fake(payload: dict):
+    """
+    Body:
+    {
+      "npc_id": "npc:bartender",
+      "player_id": "player:demo",
+      "scene": "tavern",
+      "conversation_id": "uuid-optional",
+      "user_text": "player message here",
+      "intent": "confess"  # optional
+    }
+    """
+    try:
+        npc_id = payload["npc_id"]
+        player_id = payload["player_id"]
+        scene = payload.get("scene", "tavern")
+        user_text = payload.get("user_text", "")
+        intent = payload.get("intent")
+        conv_id = payload.get("conversation_id")
+
+        # 1) reuse retrieve
+        params = {"npc_id": npc_id, "player_id": player_id, "scene": scene}
+        if intent: params["intent"] = intent
+        if conv_id: params["conversation_id"] = conv_id
+
+        r = requests.get("http://127.0.0.1:8000/v0/retrieve", params=params, timeout=15)
+        r.raise_for_status()
+        facts = r.json() or []
+        used_ids = [f["fact_id"] for f in facts]
+
+        # 2) best-effort attach
+        if conv_id and used_ids:
+            try:
+                requests.post(
+                    "http://127.0.0.1:8000/v0/conversations.attach",
+                    json={"conversation_id": conv_id, "fact_ids": used_ids},
+                    timeout=10
+                ).raise_for_status()
+            except Exception:
+                pass
+
+        # 3) synthesize fake line
+        npc_name = _npc_name(npc_id)
+        line = _fake_reply_line(npc_name, scene, intent, user_text, facts)
+
+        return {"reply": line, "used_fact_ids": used_ids}
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"missing field: {e}")
+    except requests.exceptions.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"retrieve_http_error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"fake_reply_failed: {e.__class__.__name__}: {e}" )
