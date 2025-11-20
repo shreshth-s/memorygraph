@@ -1,5 +1,6 @@
 import random
-import os,json
+import os
+import json
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,6 +8,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from typing import Optional
 from db import conn
+
+# 1. Load environment variables (e.g., OPENROUTER_API_KEY)
+load_dotenv()
 
 app = FastAPI(title="MemoryGraph API", version="0.1.0")
 
@@ -185,7 +189,6 @@ def conv_attach(payload: dict):
                 """, (cid, fid))
 
             # Roll up tags
-# 4) roll up tags from attached facts (distinct)
             cur.execute("""
             update conversations
                 set tags = coalesce((
@@ -305,7 +308,6 @@ def _fake_reply_line(npc_name: str, scene: str, intent: str | None, user_text: s
     bank = templates.get(intent, templates["default"])
     line = pick(bank)
 
-    # add speaker name
     return f"{npc_name}: {line}"
     
 
@@ -362,3 +364,115 @@ def v0_reply_fake(payload: dict):
         raise HTTPException(status_code=502, detail=f"retrieve_http_error: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"fake_reply_failed: {e.__class__.__name__}: {e}" )
+
+# --- NEW LLM Logic below ---
+
+def _call_openrouter(system_prompt: str, user_prompt: str, model: str) -> str:
+    """Helper to call OpenRouter API."""
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise HTTPException(500, "OPENROUTER_API_KEY not set in environment")
+
+    try:
+        res = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": model, 
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            },
+            timeout=25
+        )
+        res.raise_for_status()
+        data = res.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except requests.exceptions.HTTPError as e:
+        # Handle 4xx/5xx errors from OpenRouter
+        raise HTTPException(502, f"OpenRouter HTTP error: {e}")
+    except Exception as e:
+        # Handle timeouts, connection errors, etc.
+        raise HTTPException(500, f"OpenRouter call failed: {e.__class__.__name__}: {e}")
+
+@app.post("/v0/reply")
+def v0_reply_llm(payload: dict):
+    """
+    Generate a reply using OpenRouter LLM + Retrieved Memory.
+    """
+    try:
+        npc_id = payload["npc_id"]
+        player_id = payload["player_id"]
+        scene = payload.get("scene", "tavern")
+        user_text = payload.get("user_text", "")
+        if not user_text:
+            raise HTTPException(400, "user_text is required for LLM reply")
+        intent = payload.get("intent")
+        conv_id = payload.get("conversation_id")
+        
+        npc_name = _npc_name(npc_id)
+        model = payload.get("model", "mistralai/mistral-7b-instruct:free") 
+
+        # 1) Reuse retrieve (k=4 for concise context)
+        params = {"npc_id": npc_id, "player_id": player_id, "scene": scene, "k": 4} 
+        if intent: params["intent"] = intent
+        if conv_id: params["conversation_id"] = conv_id
+
+        r = requests.get("http://127.0.0.1:8000/v0/retrieve", params=params, timeout=15)
+        r.raise_for_status()
+        facts = r.json() or []
+        used_ids = [f["fact_id"] for f in facts]
+
+        # 2) Best-effort attach to conversation
+        if conv_id and used_ids:
+            try:
+                requests.post(
+                    "http://127.0.0.1:8000/v0/conversations.attach",
+                    json={"conversation_id": conv_id, "fact_ids": used_ids},
+                    timeout=10
+                ).raise_for_status()
+            except Exception:
+                pass 
+
+        # 3) Format prompt and call LLM
+        memory_str = "\n".join(f"- {f['text']}" for f in facts)
+        if not memory_str:
+            memory_str = "None."
+
+        system_prompt = f"""
+You are {npc_name}, an NPC in a game.
+Your current location is: {scene}.
+You are speaking to {player_id}.
+
+You must follow these rules:
+1. Be concise. Speak in a natural, informal style. Do not be overly verbose.
+2. Use your relevant memories to inform your reply.
+3. Do NOT narrate your actions or emotions (e.g., *I sigh*).
+4. Do NOT break character.
+
+Here are your relevant memories about {player_id}:
+{memory_str}
+
+Respond to the player's last line.
+"""
+        
+        line = _call_openrouter(system_prompt.strip(), user_text, model)
+        
+        # Cleanup: remove speaker name if LLM added it (e.g. "Bartender: Hello")
+        if line.lower().startswith(f"{npc_name.lower()}:"):
+            line = line[len(npc_name)+1:].strip()
+
+        return {"reply": line, "used_fact_ids": used_ids}
+
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"missing field: {e}")
+    except requests.exceptions.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"retrieve_http_error: {e}")
+    except HTTPException:
+        raise 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"llm_reply_failed: {e.__class__.__name__}: {e}" )

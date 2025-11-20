@@ -29,6 +29,8 @@ export default function App() {
 
   const [reply, setReply] = useState('')
   const [replying, setReplying] = useState(false)
+  // New state for LLM loading status
+  const [llmReplying, setLlmReplying] = useState(false)
 
   const [msg, setMsg] = useState('')
   const [showDebug, setShowDebug] = useState(false)
@@ -170,6 +172,52 @@ export default function App() {
       setTimeout(() => setMsg(''), 2000)
     } finally {
       setReplying(false)
+    }
+  }
+
+  // --- New function for real LLM Reply ---
+  const generateLLMReply = async () => {
+    if (!npc || !player || !line.trim()) {
+      setMsg('Player line is required for LLM reply')
+      setTimeout(() => setMsg(''), 2000)
+      return
+    }
+    setLlmReplying(true)
+    setReply('') // Clear old reply
+    try {
+      // ensure a conversation exists
+      if (!conversationId) {
+        await startConversation()
+      }
+      const body = {
+        npc_id: npc,
+        player_id: player,
+        scene,
+        conversation_id: conversationId || undefined,
+        user_text: line || '', // required for this endpoint
+        intent: intent || undefined
+      }
+      const res = await fetch(`${API}/v0/reply`, { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        setMsg(`LLM reply failed: ${err.detail || `HTTP ${res.status}`}`)
+        setTimeout(() => setMsg(''), 3000)
+        return
+      }
+      const data = await res.json()
+      setReply(data?.reply || '(no reply)')
+      // sync inspector for visibility
+      retrieve()
+    } catch (e) {
+      console.error(e)
+      setMsg('LLM reply error (see console)')
+      setTimeout(() => setMsg(''), 2000)
+    } finally {
+      setLlmReplying(false)
     }
   }
 
@@ -326,9 +374,17 @@ export default function App() {
         <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
           <button onClick={addFact} disabled={!npc || !player}>Add Fact</button>
           <button onClick={retrieve} disabled={!npc || !player}>Retrieve Top-K</button>
-          <button onClick={generateFakeReply} disabled={!npc || !player || replying}>
+          
+          {/* Fake Reply Button */}
+          <button onClick={generateFakeReply} disabled={!npc || !player || replying || llmReplying}>
             {replying ? 'Thinking…' : 'Generate Fake Reply'}
           </button>
+
+          {/* Real LLM Reply Button */}
+          <button onClick={generateLLMReply} disabled={!npc || !player || replying || llmReplying || !line.trim()}>
+            {llmReplying ? 'LLM Thinking…' : 'Generate LLM Reply'}
+          </button>
+
           <button onClick={exportAll}>Export JSON</button>
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
             <span style={{ border: '1px solid #ccc', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>
