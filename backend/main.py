@@ -1,7 +1,10 @@
 import random
+import os,json
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
+from dotenv import load_dotenv
 from typing import Optional
 from db import conn
 
