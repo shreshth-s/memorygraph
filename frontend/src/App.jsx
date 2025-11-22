@@ -29,7 +29,6 @@ export default function App() {
 
   const [reply, setReply] = useState('')
   const [replying, setReplying] = useState(false)
-  // New state for LLM loading status
   const [llmReplying, setLlmReplying] = useState(false)
 
   const [msg, setMsg] = useState('')
@@ -91,6 +90,8 @@ export default function App() {
       }),
     })
     setLine('')
+    setMsg('Fact added (embedding computed automatically)')
+    setTimeout(() => setMsg(''), 2000)
   }
 
   const retrieve = async () => {
@@ -98,9 +99,15 @@ export default function App() {
     const params = new URLSearchParams({ npc_id: npc, player_id: player, scene })
     if (intent) params.set('intent', intent)
     if (conversationId) params.set('conversation_id', conversationId)
+    
+    // --- NEW: Send the current text as a query for Semantic Search ---
+    // This allows the embedding model to find facts related to what you typed
+    if (line.trim()) params.set('query', line.trim())
+
     const res = await fetch(`${API}/v0/retrieve?` + params.toString())
     const data = await res.json()
     setFacts(data)
+    
     if (conversationId && data.length) {
       await fetch(`${API}/v0/conversations.attach`, {
         method: 'POST',
@@ -140,16 +147,14 @@ export default function App() {
     if (!npc || !player) return
     setReplying(true)
     try {
-      // ensure a conversation exists, so attachments/tags accumulate
-      if (!conversationId) {
-        await startConversation()
-      }
+      if (!conversationId) await startConversation()
+      
       const body = {
         npc_id: npc,
         player_id: player,
         scene,
         conversation_id: conversationId || undefined,
-        user_text: line || '',    // optional; gives flavor to templates
+        user_text: line || '',   
         intent: intent || undefined
       }
       const res = await fetch(`${API}/v0/reply.fake`, {
@@ -164,8 +169,7 @@ export default function App() {
       }
       const data = await res.json()
       setReply(data?.reply || '(no reply)')
-      // sync inspector for visibility
-      retrieve()
+      retrieve() // Refresh inspector to see what was used
     } catch (e) {
       console.error(e)
       setMsg('fake reply error (see console)')
@@ -175,7 +179,6 @@ export default function App() {
     }
   }
 
-  // --- New function for real LLM Reply ---
   const generateLLMReply = async () => {
     if (!npc || !player || !line.trim()) {
       setMsg('Player line is required for LLM reply')
@@ -183,18 +186,16 @@ export default function App() {
       return
     }
     setLlmReplying(true)
-    setReply('') // Clear old reply
+    setReply('') 
     try {
-      // ensure a conversation exists
-      if (!conversationId) {
-        await startConversation()
-      }
+      if (!conversationId) await startConversation()
+
       const body = {
         npc_id: npc,
         player_id: player,
         scene,
         conversation_id: conversationId || undefined,
-        user_text: line || '', // required for this endpoint
+        user_text: line || '', 
         intent: intent || undefined
       }
       const res = await fetch(`${API}/v0/reply`, { 
@@ -210,8 +211,7 @@ export default function App() {
       }
       const data = await res.json()
       setReply(data?.reply || '(no reply)')
-      // sync inspector for visibility
-      retrieve()
+      retrieve() // Sync inspector
     } catch (e) {
       console.error(e)
       setMsg('LLM reply error (see console)')
@@ -365,7 +365,7 @@ export default function App() {
           <textarea
             value={line}
             onChange={(e) => setLine(e.target.value)}
-            placeholder="Player says or event text..."
+            placeholder="Player says or event text (used as Semantic Search query)"
             rows={4}
             style={{ width: '100%' }}
           />
@@ -403,7 +403,7 @@ export default function App() {
         )}
 
         <p style={{ opacity: 0.7, marginTop: 8 }}>
-          Tip: start a conversation, add a confess line like “i still owe you 10 gold”, then Retrieve or Generate Fake Reply.
+          Tip: Type text above. "Retrieve" will use it as a search query. "Generate LLM" will respond to it.
         </p>
       </div>
 
@@ -431,11 +431,23 @@ export default function App() {
             <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
               tags: {(f.tags || []).join(', ') || '—'}
             </div>
+            
+            {/* --- UPDATED: Debug Section for new Score Structure --- */}
             {showDebug && f.debug && (
-              <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>
-                base {f.debug.base} · intent {f.debug.intent_bonus} · assoc {f.debug.assoc_bonus}
+              <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4, fontFamily: 'monospace' }}>
+                {/* Display Semantic/Vector scores if available */}
+                {f.debug.vector !== undefined ? (
+                   <>
+                     vector: {f.debug.vector} · heuristic: {f.debug.heuristic}
+                     {f.debug.blended && <span> (blended 70/30)</span>}
+                   </>
+                ) : (
+                   /* Fallback to old view if backend didn't send vector info */
+                   <>base {f.debug.base} · intent {f.debug.intent_bonus} · assoc {f.debug.assoc_bonus}</>
+                )}
               </div>
             )}
+            
             <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               {!f.pinned ? (
                 <button onClick={() => togglePin(f.fact_id, true)}>Pin</button>
